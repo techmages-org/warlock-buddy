@@ -43,6 +43,27 @@ struct TamaState {
   bool     promptInFlight;
   AccountChip accounts[8];       // up to 8 accounts; v3.2.0 has 5
   uint8_t  nAccounts;
+
+  // ─── Warlock extension (heartbeat.warlock.*) — drives the deck HUD ────────
+  bool     online;               // deck API reachable
+  bool     engaged;              // an engagement is ARMED (live)
+  char     persona[12];          // OFFLINE | SAFE | ATTENTION | ARMED
+  char     engId[40];            // active engagement id (for END)
+  char     engName[24];          // active engagement name
+  uint8_t  scopeSsids, scopeBssids, scopeIps;  // active scope cardinality
+  bool     aarEnabled;
+  uint32_t aarRecords;           // signed attestations ("sigils")
+  char     aarSubject[64];       // did:web subject
+  bool     haveTemp;
+  float    tempC;                // deck CPU temp
+  bool     haveCpu, haveMem;
+  float    cpuPct, memPct;
+  bool     gpsFix;               // gps.ok && mode>=2
+  int16_t  meshNodes;            // -1 = unknown/null
+  int16_t  sdrCount;             // -1 = none/null
+  uint8_t  nDrafts;              // staged engagements awaiting ARM
+  char     draftId[4][40];
+  char     draftName[4][24];
 };
 
 // ---------------------------------------------------------------------------
@@ -58,11 +79,14 @@ static bool     _demoMode   = false;
 static uint8_t  _demoIdx    = 0;
 static uint32_t _demoNext   = 0;
 
-struct _Fake { const char* n; uint8_t t,r,w; bool c; uint32_t tok; };
+// Warlock demo scenarios — cycle SAFE → staged → ARMED for screenshots/booth.
+struct _Fake { const char* persona; const char* eng; uint8_t drafts; uint32_t sigils; bool armed; };
 static const _Fake _FAKES[] = {
-  {"asleep",0,0,0,false,0}, {"one idle",1,0,0,false,12000},
-  {"busy",4,3,0,false,89000}, {"attention",2,1,1,false,45000},
-  {"completed",1,0,0,true,142000},
+  {"SAFE",      "",                0, 3,  false},
+  {"ATTENTION", "",                2, 3,  false},
+  {"ARMED",     "Acme HQ Wi-Fi",   0, 7,  true},
+  {"ARMED",     "10.0.0.0/24 sweep",1, 11, true},
+  {"SAFE",      "",                0, 12, false},
 };
 
 inline void dataSetDemo(bool on) {
@@ -81,7 +105,7 @@ inline bool dataBtActive() {
 }
 
 inline const char* dataScenarioName() {
-  if (_demoMode) return _FAKES[_demoIdx].n;
+  if (_demoMode) return _FAKES[_demoIdx].persona;
   if (dataConnected()) return dataBtActive() ? "bt" : "usb";
   return "none";
 }
@@ -188,6 +212,62 @@ static void _applyJson(const char* line, TamaState* out) {
     }
   }
 
+  // Owner name push: {"cmd":"owner","name":"jason"} — shown as OP: in the HUD.
+  if (strcmp(doc["cmd"] | "", "owner") == 0) {
+    const char* nm = doc["name"] | "";
+    if (nm[0] && strcmp(nm, ownerName()) != 0) ownerSet(nm);  // NVS write only on change
+  }
+
+  // Rich warlock.* extension — the deck HUD's data source.
+  JsonObject wx = doc["warlock"];
+  if (!wx.isNull()) {
+    out->online  = wx["online"]  | false;
+    out->engaged = wx["engaged"] | false;
+    const char* ps = wx["persona"] | "SAFE";
+    strncpy(out->persona, ps, sizeof(out->persona)-1); out->persona[sizeof(out->persona)-1]=0;
+
+    JsonObject e = wx["engagement"];
+    const char* eid = e["id"]   | "";
+    const char* enm = e["name"] | "";
+    strncpy(out->engId,   eid, sizeof(out->engId)-1);   out->engId[sizeof(out->engId)-1]=0;
+    strncpy(out->engName, enm, sizeof(out->engName)-1); out->engName[sizeof(out->engName)-1]=0;
+    JsonObject sc = e["scope"];
+    out->scopeSsids  = sc["ssids"]     | 0;
+    out->scopeBssids = sc["bssids"]    | 0;
+    out->scopeIps    = sc["ip_ranges"] | 0;
+
+    JsonObject aar = wx["aar"];
+    out->aarEnabled = aar["enabled"] | false;
+    out->aarRecords = aar["records"] | 0UL;
+    const char* sub = aar["subject"] | "";
+    strncpy(out->aarSubject, sub, sizeof(out->aarSubject)-1); out->aarSubject[sizeof(out->aarSubject)-1]=0;
+
+    JsonObject sys = wx["sys"];
+    out->haveTemp = sys["temp_c"].is<float>();
+    out->tempC    = sys["temp_c"] | 0.0f;
+    out->haveCpu  = sys["cpu_pct"].is<float>();
+    out->cpuPct   = sys["cpu_pct"] | 0.0f;
+    out->haveMem  = sys["mem_pct"].is<float>();
+    out->memPct   = sys["mem_pct"] | 0.0f;
+    out->gpsFix   = sys["gps_fix"] | false;
+    out->meshNodes = sys["mesh_nodes"].is<int>() ? (int16_t)(sys["mesh_nodes"] | 0) : -1;
+    out->sdrCount  = sys["sdr"].is<int>()        ? (int16_t)(sys["sdr"] | 0)        : -1;
+
+    JsonArray dr = wx["drafts"];
+    uint8_t n = 0;
+    if (!dr.isNull()) {
+      for (JsonObject d : dr) {
+        if (n >= 4) break;
+        const char* di = d["id"]   | "";
+        const char* dn = d["name"] | "";
+        strncpy(out->draftId[n],   di, sizeof(out->draftId[n])-1);   out->draftId[n][sizeof(out->draftId[n])-1]=0;
+        strncpy(out->draftName[n], dn, sizeof(out->draftName[n])-1); out->draftName[n][sizeof(out->draftName[n])-1]=0;
+        n++;
+      }
+    }
+    out->nDrafts = n;
+  }
+
   out->lastUpdated = millis();
   _lastLiveMs = millis();
 }
@@ -216,10 +296,25 @@ inline void dataPoll(TamaState* out) {
   if (_demoMode) {
     if (now >= _demoNext) { _demoIdx = (_demoIdx + 1) % 5; _demoNext = now + 8000; }
     const _Fake& s = _FAKES[_demoIdx];
-    out->sessionsTotal=s.t; out->sessionsRunning=s.r; out->sessionsWaiting=s.w;
-    out->recentlyCompleted=s.c; out->tokensToday=s.tok; out->lastUpdated=now;
+    out->lastUpdated = now;
     out->connected = true;
-    snprintf(out->msg, sizeof(out->msg), "demo: %s", s.n);
+    out->online = true;
+    out->engaged = s.armed;
+    strncpy(out->persona, s.persona, sizeof(out->persona)-1); out->persona[sizeof(out->persona)-1]=0;
+    strncpy(out->engName, s.eng, sizeof(out->engName)-1); out->engName[sizeof(out->engName)-1]=0;
+    strncpy(out->engId, s.armed ? "demo-engagement-id" : "", sizeof(out->engId)-1); out->engId[sizeof(out->engId)-1]=0;
+    out->scopeSsids = s.armed ? 1 : 0; out->scopeBssids = 0; out->scopeIps = s.armed ? 2 : 0;
+    out->aarEnabled = true; out->aarRecords = s.sigils;
+    out->nDrafts = s.drafts;
+    for (uint8_t i = 0; i < s.drafts && i < 4; i++) {
+      snprintf(out->draftId[i], sizeof(out->draftId[i]), "demo-draft-%u", i);
+      snprintf(out->draftName[i], sizeof(out->draftName[i]), i ? "Guest VLAN" : "Floor-3 sweep");
+    }
+    out->haveTemp = true; out->tempC = 47.5f;
+    out->haveCpu = true; out->cpuPct = 23.0f;
+    out->haveMem = true; out->memPct = 41.0f;
+    out->gpsFix = true; out->meshNodes = 4; out->sdrCount = 3;
+    snprintf(out->msg, sizeof(out->msg), "demo: %s", s.persona);
     return;
   }
 
@@ -244,7 +339,9 @@ inline void dataPoll(TamaState* out) {
   if (!out->connected) {
     out->sessionsTotal=0; out->sessionsRunning=0; out->sessionsWaiting=0;
     out->recentlyCompleted=false; out->lastUpdated=now;
-    strncpy(out->msg, "subctl unreachable", sizeof(out->msg)-1);
+    out->online = false; out->engaged = false; out->nDrafts = 0;
+    strncpy(out->persona, "OFFLINE", sizeof(out->persona)-1); out->persona[sizeof(out->persona)-1]=0;
+    strncpy(out->msg, "deck offline", sizeof(out->msg)-1);
     out->msg[sizeof(out->msg)-1]=0;
   }
 }
