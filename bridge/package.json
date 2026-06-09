@@ -20,6 +20,7 @@
     "typescript": "^5.6.0"
   },
   "trustedDependencies": [
-    "@abandonware/noble"
+    "@abandonware/noble",
+    "@abandonware/bluetooth-hci-socket"
   ]
 }

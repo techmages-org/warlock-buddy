@@ -96,6 +96,10 @@ export async function runDaemon(args: string[] = []): Promise<void> {
       i++;
     }
   }
+  // Env fallback so the systemd unit on the deck needs no CLI args.
+  if (!targetName && process.env.WARLOCK_BUDDY_DEVICE) {
+    targetName = process.env.WARLOCK_BUDDY_DEVICE;
+  }
 
   console.log("[bridge] warlock-buddy starting");
   console.log(targetName
