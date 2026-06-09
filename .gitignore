@@ -1,0 +1,12 @@
+.DS_Store
+*.log
+
+# PlatformIO build artifacts
+.pio/
+.vscode/
+data/
+
+# Bun
+node_modules/
+bun.lockb
+backups/*.bin
